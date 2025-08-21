@@ -233,24 +233,39 @@ func Scan(ctx context.Context, name string, tarball string, checkData bool) ([]*
 		Logger.Println("error:", err)
 		return nil, nil, err
 	}
-	var manifests []Manifest
-	var files []*ScanFile
-	var r io.ReadCloser
+	
+	// Save image to a buffer first so we can read it twice
+	var imageData bytes.Buffer
 	if tarball != "" {
-		r, err = os.Open(tarball)
+		file, err := os.Open(tarball)
+		if err != nil {
+			Logger.Println("error:", err)
+			return nil, nil, err
+		}
+		defer func() { _ = file.Close() }()
+		_, err = io.Copy(&imageData, file)
 		if err != nil {
 			Logger.Println("error:", err)
 			return nil, nil, err
 		}
 	} else {
-		r, err = cli.ImageSave(ctx, []string{name})
+		r, err := cli.ImageSave(ctx, []string{name})
+		if err != nil {
+			Logger.Println("error:", err)
+			return nil, nil, err
+		}
+		defer func() { _ = r.Close() }()
+		_, err = io.Copy(&imageData, r)
 		if err != nil {
 			Logger.Println("error:", err)
 			return nil, nil, err
 		}
 	}
-	defer func() { _ = r.Close() }()
-	tr := tar.NewReader(r)
+
+	// First pass: extract manifest to identify layer blobs
+	var manifests []Manifest
+	layerBlobs := make(map[string]bool)
+	tr := tar.NewReader(bytes.NewReader(imageData.Bytes()))
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -263,28 +278,51 @@ func Scan(ctx context.Context, name string, tarball string, checkData bool) ([]*
 		if header == nil {
 			continue
 		}
-		switch header.Typeflag {
-		case tar.TypeReg:
-			if path.Base(header.Name) == "layer.tar" {
-				layerFiles, err := ScanLayer(header.Name, tr, checkData)
-				if err != nil {
-					Logger.Println("error:", err)
-					return nil, nil, err
-				}
-				files = append(files, layerFiles...)
-			} else if header.Name == "manifest.json" {
-				var data bytes.Buffer
-				_, err := io.Copy(&data, tr)
-				if err != nil {
-					Logger.Println("error:", err)
-					return nil, nil, err
-				}
-				err = json.Unmarshal(data.Bytes(), &manifests)
-				if err != nil {
-					Logger.Println("error:", err)
-					return nil, nil, err
+		if header.Typeflag == tar.TypeReg && header.Name == "manifest.json" {
+			var data bytes.Buffer
+			_, err := io.Copy(&data, tr)
+			if err != nil {
+				Logger.Println("error:", err)
+				return nil, nil, err
+			}
+			err = json.Unmarshal(data.Bytes(), &manifests)
+			if err != nil {
+				Logger.Println("error:", err)
+				return nil, nil, err
+			}
+			// Mark layer blobs for OCI format
+			for _, m := range manifests {
+				for _, layer := range m.Layers {
+					layerBlobs[layer] = true
 				}
 			}
+			break // Found manifest, no need to continue first pass
+		}
+	}
+
+	// Second pass: process layers
+	var files []*ScanFile
+	tr = tar.NewReader(bytes.NewReader(imageData.Bytes()))
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			Logger.Println("error:", err)
+			return nil, nil, err
+		}
+		if header == nil {
+			continue
+		}
+		if header.Typeflag == tar.TypeReg && layerBlobs[header.Name] {
+			// Handle OCI format with blobs/sha256/* files
+			layerFiles, err := ScanLayer(header.Name, tr, checkData)
+			if err != nil {
+				Logger.Println("error:", err)
+				return nil, nil, err
+			}
+			files = append(files, layerFiles...)
 		}
 	}
 
@@ -322,7 +360,7 @@ func Scan(ctx context.Context, name string, tarball string, checkData bool) ([]*
 		}
 		last = f
 	}
-	if last.Path != result[len(result)-1].Path {
+	if last != nil && (len(result) == 0 || last.Path != result[len(result)-1].Path) {
 		result = append(result, last)
 	}
 	return result, layers, nil
