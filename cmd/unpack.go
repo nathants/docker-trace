@@ -3,6 +3,7 @@ package dockertrace
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -56,18 +57,13 @@ func unpack() {
 	}
 
 	layerNames := make(map[string]string)
-	for i, layerID := range manifest.Layers {
-		layerID = path.Dir(layerID)
-		layerNames[layerID] = fmt.Sprintf("layer%02d", i)
+	for i, layerBlob := range manifest.Layers {
+		layerNames[layerBlob] = fmt.Sprintf("layer%02d", i)
 	}
 
 	if !args.NoRename {
-		for _, layerTar := range manifest.Layers {
-			err := renameSymlink(layerTar, layerNames)
-			if err != nil {
-				lib.Logger.Fatal("error:", err)
-			}
-			err = renameDirectory(layerTar, layerNames)
+		for _, layerBlob := range manifest.Layers {
+			err := moveAndRenameBlob(layerBlob, layerNames)
 			if err != nil {
 				lib.Logger.Fatal("error:", err)
 			}
@@ -75,8 +71,8 @@ func unpack() {
 	}
 
 	if !args.NoUntar {
-		for _, layerTar := range manifest.Layers {
-			err := untarLayer(args.NoRename, layerTar, layerNames)
+		for _, layerBlob := range manifest.Layers {
+			err := untarLayer(args.NoRename, layerBlob, layerNames)
 			if err != nil {
 				lib.Logger.Fatal("error:", err)
 			}
@@ -84,84 +80,92 @@ func unpack() {
 	}
 
 	if !args.NoUntar {
-		for _, layerTar := range manifest.Layers {
-			err := deleteLayerExtras(args.NoRename, layerTar, layerNames)
+		for _, layerBlob := range manifest.Layers {
+			err := deleteLayerTarball(args.NoRename, layerBlob, layerNames)
 			if err != nil {
 				lib.Logger.Fatal("error:", err)
 			}
 		}
+	}
+
+	if !args.NoRename {
+		_ = os.RemoveAll("blobs")
 	}
 
 }
 
-func deleteLayerExtras(noRename bool, layerTar string, layerNames map[string]string) error {
-	layerID := path.Base(path.Dir(layerTar))
+func deleteLayerTarball(noRename bool, layerBlob string, layerNames map[string]string) error {
+	layerName := layerBlob
 	if !noRename {
 		var ok bool
-		layerID, ok = layerNames[layerID]
+		layerName, ok = layerNames[layerBlob]
 		if !ok {
-			return fmt.Errorf("error: %s %v", layerID, layerNames)
+			return fmt.Errorf("error: %s %v", layerBlob, layerNames)
 		}
+		layerName = layerName + ".tar"
 	}
-	for _, name := range []string{"json", "VERSION", "layer.tar"} {
-		err := os.Remove(path.Join(layerID, name))
-		if err != nil {
-			return err
-		}
+	err := os.Remove(layerName)
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }
 
-func untarLayer(noRename bool, layerTar string, layerNames map[string]string) error {
-	layerID := path.Base(path.Dir(layerTar))
+func untarLayer(noRename bool, layerBlob string, layerNames map[string]string) error {
+	tarFile := layerBlob
+	layerDir := path.Base(layerBlob)
 	if !noRename {
 		var ok bool
-		layerID, ok = layerNames[layerID]
+		layerDir, ok = layerNames[layerBlob]
 		if !ok {
-			return fmt.Errorf("no layer match: %s %v", layerID, layerNames)
+			return fmt.Errorf("no layer match: %s %v", layerBlob, layerNames)
 		}
+		tarFile = layerDir + ".tar"
 	}
-	cmd := exec.Command("tar", "--delay-directory-restore", "-xf", "layer.tar")
-	cmd.Dir = layerID
-	err := cmd.Run()
+
+	err := os.MkdirAll(layerDir, 0755)
 	if err != nil {
-		return fmt.Errorf("tar expansion failure: %w %s", err, layerID)
+		return fmt.Errorf("mkdir failure: %w %s", err, layerDir)
+	}
+
+	cmd := exec.Command("tar", "--delay-directory-restore", "-xf", "../"+tarFile)
+	cmd.Dir = layerDir
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("tar expansion failure: %w %s", err, layerDir)
 	}
 	return nil
 }
 
-func renameSymlink(layerTar string, layerNames map[string]string) error {
-	link, err := os.Readlink(layerTar)
-	if err == nil {
-		err := os.Remove(layerTar)
-		if err != nil {
-			return err
-		}
-		layerID := path.Base(path.Dir(link))
-		layerName, ok := layerNames[layerID]
-		if !ok {
-			lib.Logger.Fatal("error:", layerID, layerNames)
-		}
-		err = os.Symlink(
-			path.Join("..", layerName, "layer.tar"),
-			path.Join(layerTar),
-		)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func renameDirectory(layerTar string, layerNames map[string]string) error {
-	layerID := path.Base(path.Dir(layerTar))
-	layerName, ok := layerNames[layerID]
+func moveAndRenameBlob(layerBlob string, layerNames map[string]string) error {
+	layerName, ok := layerNames[layerBlob]
 	if !ok {
-		return fmt.Errorf("error: %s %v", layerID, layerNames)
+		return fmt.Errorf("error: %s %v", layerBlob, layerNames)
 	}
-	err := os.Rename(layerID, layerName)
+	newName := layerName + ".tar"
+
+	source, err := os.Open(layerBlob)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = source.Close() }()
+
+	dest, err := os.Create(newName)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dest.Close() }()
+
+	_, err = io.Copy(dest, source)
+	if err != nil {
+		return err
+	}
+
+	_ = source.Close()
+	err = os.Remove(layerBlob)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }

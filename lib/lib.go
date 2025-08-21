@@ -233,7 +233,7 @@ func Scan(ctx context.Context, name string, tarball string, checkData bool) ([]*
 		Logger.Println("error:", err)
 		return nil, nil, err
 	}
-	
+
 	// Save image to a buffer first so we can read it twice
 	var imageData bytes.Buffer
 	if tarball != "" {
