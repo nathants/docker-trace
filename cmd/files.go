@@ -26,9 +26,6 @@ func (filesArgs) Description() string {
 	return "\nbpftrace filesystem access in a running container\n"
 }
 
-const filesBpftraceFilterFilename = `/strncmp("/proc/", str(args->filename), 6) != 0 && strncmp("/sys/", str(args->filename), 5) != 0 && strncmp("/dev/", str(args->filename), 5) != 0/`
-const filesBpftraceFilterPathname = `/strncmp("/proc/", str(args->pathname), 6) != 0 && strncmp("/sys/", str(args->pathname), 5) != 0 && strncmp("/dev/", str(args->pathname), 5) != 0/`
-const filesBpftraceFilterPath = `/strncmp("/proc/", str(args->path), 6) != 0 && strncmp("/sys/", str(args->path), 5) != 0 && strncmp("/dev/", str(args->path), 5) != 0/`
 const filesBpftraceFilterTID = `/@filename[tid] != 0/`
 
 const filesBpftrace = `#!/usr/bin/env bpftrace

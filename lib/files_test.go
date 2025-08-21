@@ -160,7 +160,7 @@ func traceCmd(dir string, command string) ([]string, error) {
 	}
 	line := <-stderrChan
 	if line != "ready" {
-		return nil, fmt.Errorf(line)
+		return nil, fmt.Errorf("%s", line)
 	}
 	id, err := runStdoutFiles("docker", "run", "-d", "-t", "-v", dir+":/code", "--rm", containerFiles, "bash", "-c", command)
 	if err != nil {

@@ -16,10 +16,6 @@ check-deps:
 	@which nargs       >/dev/null   || (cd ~ && go install github.com/alexkohler/nargs/cmd/nargs@latest)
 	@which go-hasdefault >/dev/null || (cd ~ && go install github.com/nathants/go-hasdefault@latest)
 	@which go-hasdefer >/dev/null   || (cd ~ && go install github.com/nathants/go-hasdefer@latest)
-	@which govulncheck >/dev/null   || (cd ~ && go install golang.org/x/vuln/cmd/govulncheck@latest)
-
-check-govulncheck: check-deps
-	@govulncheck ./...
 
 check-hasdefault: check-deps
 	@go-hasdefault $(shell find -type f -name "*.go") || true

@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/alexflint/go-arg"
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/build"
 	"github.com/docker/docker/client"
 	"github.com/gofrs/uuid"
 	"github.com/nathants/docker-trace/lib"
@@ -292,7 +292,7 @@ func minify() {
 		lib.Logger.Println("finished writing context")
 	}()
 	//
-	out, err := cli.ImageBuild(ctx, prContext, types.ImageBuildOptions{
+	out, err := cli.ImageBuild(ctx, prContext, build.ImageBuildOptions{
 		NoCache:    true,
 		Tags:       []string{args.ContainerOut},
 		Dockerfile: lib.DataDir() + "/Dockerfile." + uid,
