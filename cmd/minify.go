@@ -173,7 +173,8 @@ func minify() {
 		}
 		switch header.Typeflag {
 		case tar.TypeReg:
-			if path.Base(header.Name) == "layer.tar" {
+			// OCI format: layers are blobs/sha256/* files
+			if _, ok := layers[header.Name]; ok {
 				minifyLayer(header.Name, tr, tw, layers, includeFiles)
 				lib.Logger.Println("minified layer", header.Name)
 			}
@@ -203,7 +204,7 @@ func minify() {
 	if err != nil {
 		lib.Logger.Fatal("error: ", err)
 	}
-	_, err = f.WriteString(fmt.Sprintf("ADD %s/out.tar.%s /\n", lib.DataDir(), uid))
+	_, err = f.WriteString(fmt.Sprintf("ADD out.tar.%s /\n", uid))
 	if err != nil {
 		lib.Logger.Fatal("error: ", err)
 	}
@@ -229,7 +230,7 @@ func minify() {
 			lib.Logger.Fatal("error: ", err)
 		}
 		header, err := tar.FileInfoHeader(fi, "")
-		header.Name = lib.DataDir() + "/out.tar." + uid
+		header.Name = "out.tar." + uid
 		if err != nil {
 			lib.Logger.Fatal("error: ", err)
 		}
@@ -255,7 +256,7 @@ func minify() {
 			lib.Logger.Fatal("error: ", err)
 		}
 		header, err = tar.FileInfoHeader(fi, "")
-		header.Name = lib.DataDir() + "/Dockerfile." + uid
+		header.Name = "Dockerfile." + uid
 		if err != nil {
 			lib.Logger.Fatal("error: ", err)
 		}
@@ -295,7 +296,7 @@ func minify() {
 	out, err := cli.ImageBuild(ctx, prContext, build.ImageBuildOptions{
 		NoCache:    true,
 		Tags:       []string{args.ContainerOut},
-		Dockerfile: lib.DataDir() + "/Dockerfile." + uid,
+		Dockerfile: "Dockerfile." + uid,
 		Remove:     true,
 	})
 	defer func() { _ = out.Body.Close() }()

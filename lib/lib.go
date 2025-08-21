@@ -510,7 +510,7 @@ func Dockerfile(ctx context.Context, name string, tarball string) ([]string, err
 					Logger.Println("error:", err)
 					return nil, err
 				}
-			} else if strings.HasSuffix(header.Name, ".json") {
+			} else if strings.HasSuffix(header.Name, ".json") || strings.HasPrefix(header.Name, "blobs/sha256/") {
 				var data bytes.Buffer
 				_, err := io.Copy(&data, tr)
 				if err != nil {
@@ -520,8 +520,8 @@ func Dockerfile(ctx context.Context, name string, tarball string) ([]string, err
 				config := DockerfileConfig{}
 				err = json.Unmarshal(data.Bytes(), &config)
 				if err != nil {
-					Logger.Println("error:", err)
-					return nil, err
+					// Skip non-JSON blobs (layer tar files)
+					continue
 				}
 				configs[header.Name] = &config
 			}
