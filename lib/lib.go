@@ -589,14 +589,9 @@ func last(xs []string) string {
 func FilesHandleLine(cwds, cgroups map[string]string, line string) {
 	file := FilesParseLine(line)
 	if file.Syscall == "cgroup_mkdir" {
-		// track cgroups of docker containers as they start
-		//
-		// /sys/fs/cgroup/system.slice/docker-425428dfb2644cfd111d406b5f8f68a7596731a451f0169caa7393f3a39db9ca.scope
-		//
-		part := last(strings.Split(file.File, "/"))
-		if strings.HasPrefix(part, "docker-") {
-			cgroups[file.Cgroup] = part[7 : 64+7]
-		}
+		// track ALL cgroups created after docker-trace starts
+		// these will be new containers, not existing system cgroups
+		cgroups[file.Cgroup] = file.File
 	} else if cgroups[file.Cgroup] != "" && file.File != "" && file.Errno == "0" {
 		// pids start at cwd of parent
 		_, ok := cwds[file.Pid]
