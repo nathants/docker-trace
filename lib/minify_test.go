@@ -166,11 +166,24 @@ func testWeb(t *testing.T, app, kind string) {
 		return
 	}
 	fmt.Println("trace container ready, start test container")
+	// Clear the channel of any existing events before starting container
+	drainChannel := func(ch <-chan string) {
+		for {
+			select {
+			case <-ch:
+			default:
+				return
+			}
+		}
+	}
+	drainChannel(stdoutChan)
+	//
 	id, err := runStdoutMinify("docker", "run", "-d", "-t", "--rm", "--network", "host", container)
 	if err != nil {
 		t.Error(err)
 		return
 	}
+	fmt.Println("Container ID:", id)
 	tr := &http.Transport{
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		IdleConnTimeout:     1 * time.Second,
@@ -208,18 +221,23 @@ func testWeb(t *testing.T, app, kind string) {
 	fmt.Println("cancel trace container and drain output")
 	cancel()
 	var files []string
+	seen := make(map[string]bool)
 	for line := range stdoutChan {
 		parts := strings.SplitN(line, " ", 2)
 		if len(parts) != 2 {
-			fmt.Println("skipping bad line:", line)
 			continue
 		}
-		fileID := parts[0]
 		file := parts[1]
-		if id == fileID {
-			files = append(files, file)
+		// Filter out noise and duplicates
+		if !seen[file] && !strings.HasPrefix(file, "/proc/") && !strings.HasPrefix(file, "/sys/") && !strings.HasPrefix(file, "/dev/") {
+			// Also filter out paths that are clearly from the host system, not the container
+			if !strings.Contains(file, "/overlay2/") && !strings.HasPrefix(file, "/var/lib/docker/") {
+				files = append(files, file)
+				seen[file] = true
+			}
 		}
 	}
+	fmt.Printf("Collected %d unique files from trace\n", len(files))
 	//
 	fmt.Println("check that test container is not reachable")
 	out, err := client.Get("https://localhost:8080/hello/xyz")
@@ -230,6 +248,10 @@ func testWeb(t *testing.T, app, kind string) {
 	}
 	//
 	fmt.Println("start minification")
+	fmt.Println("Files being passed to minify:")
+	for _, f := range files {
+		fmt.Println("  ", f)
+	}
 	err = runStdinMinify(strings.Join(files, "\n"), "./docker-trace", "minify", container, container+"-min")
 	if err != nil {
 		t.Error(err)

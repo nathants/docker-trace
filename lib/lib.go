@@ -222,7 +222,7 @@ func FindManifest(manifests []Manifest, name string) (Manifest, error) {
 			return Manifest{}, err
 		}
 	}
-	err := fmt.Errorf(Pformat(manifests) + "\ntag not found in manifest")
+	err := fmt.Errorf("%s", Pformat(manifests) + "\ntag not found in manifest")
 	Logger.Println("error:", err)
 	return Manifest{}, err
 }
@@ -629,7 +629,16 @@ func FilesHandleLine(cwds, cgroups map[string]string, line string) {
 	if file.Syscall == "cgroup_mkdir" {
 		// track ALL cgroups created after docker-trace starts
 		// these will be new containers, not existing system cgroups
-		cgroups[file.Cgroup] = file.File
+		// Extract Docker container ID from cgroup path if present
+		// Path format: docker-CONTAINERID.scope or just N.scope
+		if strings.HasPrefix(file.File, "docker-") && strings.HasSuffix(file.File, ".scope") {
+			// Extract container ID from docker-CONTAINERID.scope
+			containerID := strings.TrimPrefix(file.File, "docker-")
+			containerID = strings.TrimSuffix(containerID, ".scope")
+			cgroups[file.Cgroup] = containerID
+		} else {
+			cgroups[file.Cgroup] = file.File
+		}
 	} else if cgroups[file.Cgroup] != "" && file.File != "" && file.Errno == "0" {
 		// pids start at cwd of parent
 		_, ok := cwds[file.Pid]
@@ -658,7 +667,8 @@ func FilesHandleLine(cwds, cgroups map[string]string, line string) {
 			file.File = path.Join(cwd, file.File)
 		}
 		//
+		containerID := cgroups[file.Cgroup]
 		// _, _ = fmt.Fprintln(os.Stderr, file.Pid, file.Ppid, fmt.Sprintf("%-40s", file.File), fmt.Sprintf("%-10s", file.Comm), file.Errno, file.Syscall)
-		fmt.Println(cgroups[file.Cgroup], file.File)
+		fmt.Println(containerID, file.File)
 	}
 }

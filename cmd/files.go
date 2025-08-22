@@ -33,28 +33,28 @@ const filesBpftrace = `#!/usr/bin/env bpftrace
 #include <linux/sched.h>
 
 // Track docker container creation via cgroup - format: syscall, cgroup, pid, ppid, comm, errno, path
-tracepoint:cgroup:cgroup_mkdir { 
-    printf("cgroup_mkdir\t%llu\t0\t0\t-\t0\t%s\n", args->id, str(args->path)); 
+tracepoint:cgroup:cgroup_mkdir {
+    printf("cgroup_mkdir\t%llu\t0\t0\t-\t0\t%s\n", args->id, str(args->path));
 }
 
 // Track exec calls directly without storing in map
-tracepoint:syscalls:sys_enter_exec* { 
+tracepoint:syscalls:sys_enter_exec* {
     $fn = str(args->filename);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        printf("exec\t%llu\t%d\t%d\t%s\t0\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $fn); 
+        printf("exec\t%llu\t%d\t%d\t%s\t0\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $fn);
     }
 }
 
 // Store filenames from sys_enter for later use in sys_exit
 tracepoint:syscalls:sys_enter_creat,
 tracepoint:syscalls:sys_enter_statfs,
-tracepoint:syscalls:sys_enter_readlinkat { 
-    @filename[tid] = args->pathname; 
+tracepoint:syscalls:sys_enter_readlinkat {
+    @filename[tid] = args->pathname;
 }
 
 tracepoint:syscalls:sys_enter_readlink,
-tracepoint:syscalls:sys_enter_truncate { 
-    @filename[tid] = args->path; 
+tracepoint:syscalls:sys_enter_truncate {
+    @filename[tid] = args->path;
 }
 
 tracepoint:syscalls:sys_enter_utimensat,
@@ -70,172 +70,172 @@ tracepoint:syscalls:sys_enter_faccessat,
 tracepoint:syscalls:sys_enter_utime,
 tracepoint:syscalls:sys_enter_utimes,
 tracepoint:syscalls:sys_enter_newstat,
-tracepoint:syscalls:sys_enter_newlstat { 
-    @filename[tid] = args->filename; 
+tracepoint:syscalls:sys_enter_newlstat {
+    @filename[tid] = args->filename;
 }
 
 // Handle sys_exit events - FILTER_TID checks map existence, then filter paths inside the block
-tracepoint:syscalls:sys_exit_utimensat  FILTER_TID { 
+tracepoint:syscalls:sys_exit_utimensat  FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("utimensat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("utimensat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_faccessat  FILTER_TID { 
+tracepoint:syscalls:sys_exit_faccessat  FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("faccessat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("faccessat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_chdir      FILTER_TID { 
+tracepoint:syscalls:sys_exit_chdir      FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("chdir\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("chdir\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_access     FILTER_TID { 
+tracepoint:syscalls:sys_exit_access     FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("access\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("access\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_futimesat  FILTER_TID { 
+tracepoint:syscalls:sys_exit_futimesat  FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("futimesat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("futimesat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_open       FILTER_TID { 
+tracepoint:syscalls:sys_exit_open       FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("open\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("open\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_openat     FILTER_TID { 
+tracepoint:syscalls:sys_exit_openat     FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("openat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("openat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_readlink   FILTER_TID { 
+tracepoint:syscalls:sys_exit_readlink   FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("readlink\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("readlink\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_truncate   FILTER_TID { 
+tracepoint:syscalls:sys_exit_truncate   FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("truncate\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("truncate\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_readlinkat FILTER_TID { 
+tracepoint:syscalls:sys_exit_readlinkat FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("readlinkat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("readlinkat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_statfs     FILTER_TID { 
+tracepoint:syscalls:sys_exit_statfs     FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("statfs\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("statfs\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_creat      FILTER_TID { 
+tracepoint:syscalls:sys_exit_creat      FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("creat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("creat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_statx      FILTER_TID { 
+tracepoint:syscalls:sys_exit_statx      FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("statx\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("statx\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_newstat    FILTER_TID { 
+tracepoint:syscalls:sys_exit_newstat    FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("newstat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("newstat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_mknod      FILTER_TID { 
+tracepoint:syscalls:sys_exit_mknod      FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("mknod\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("mknod\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_mknodat    FILTER_TID { 
+tracepoint:syscalls:sys_exit_mknodat    FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("mknodat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("mknodat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_utimes     FILTER_TID { 
+tracepoint:syscalls:sys_exit_utimes     FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("utimes\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("utimes\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
-tracepoint:syscalls:sys_exit_newlstat   FILTER_TID { 
+tracepoint:syscalls:sys_exit_newlstat   FILTER_TID {
     $fn = str(@filename[tid]);
     if (strncmp("/proc/", $fn, 6) != 0 && strncmp("/sys/", $fn, 5) != 0 && strncmp("/dev/", $fn, 5) != 0) {
-        $ret = args->ret; 
-        $errno = $ret >= 0 ? 0 : - $ret; 
-        printf("newlstat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn); 
+        $ret = args->ret;
+        $errno = $ret >= 0 ? 0 : - $ret;
+        printf("newlstat\t%llu\t%d\t%d\t%s\t%d\t%s\n", cgroup, pid, ((struct task_struct *)curtask)->real_parent->pid, comm, $errno, $fn);
     }
-    delete(@filename[tid]); 
+    delete(@filename[tid]);
 }
 
 END { clear(@filename); }
@@ -279,7 +279,7 @@ func files() {
 	}
 	lib.SignalHandler(cleanup)
 	//
-	env := "BPFTRACE_STRLEN=200 BPFTRACE_MAP_KEYS_MAX=8192 BPFTRACE_PERF_RB_PAGES=" + fmt.Sprint(args.BpfRingBufferPages)
+	env := "BPFTRACE_MAX_STRLEN=200 BPFTRACE_MAX_MAP_KEYS=8192 BPFTRACE_PERF_RB_PAGES=" + fmt.Sprint(args.BpfRingBufferPages)
 	cmd := exec.CommandContext(ctx, "/usr/bin/sudo", "bash", "-c", env+" bpftrace "+tempDir+"/files.bt")
 	cmd.Stderr = os.Stderr
 	stdout, err := cmd.StdoutPipe()

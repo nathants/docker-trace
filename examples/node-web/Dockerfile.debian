@@ -1,4 +1,4 @@
-FROM debian:bullseye
+FROM debian:latest
 
 RUN apt update -y && \
     apt install -y npm openssl

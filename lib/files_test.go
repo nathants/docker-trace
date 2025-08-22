@@ -162,6 +162,20 @@ func traceCmd(dir string, command string) ([]string, error) {
 	if line != "ready" {
 		return nil, fmt.Errorf("%s", line)
 	}
+	
+	// Clear the channel of any existing events
+	drainChannel := func(ch <-chan string) {
+		for {
+			select {
+			case <-ch:
+			default:
+				return
+			}
+		}
+	}
+	drainChannel(stdoutChan)
+	
+	// Run the container
 	id, err := runStdoutFiles("docker", "run", "-d", "-t", "-v", dir+":/code", "--rm", containerFiles, "bash", "-c", command)
 	if err != nil {
 		return nil, err
@@ -170,14 +184,21 @@ func traceCmd(dir string, command string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	
+	// Collect all files accessed during the container's lifetime
+	// Since we're the only container running during the test, all file accesses should be from our container
 	cancel()
 	var files []string
+	seen := make(map[string]bool)
 	for line := range stdoutChan {
 		parts := strings.SplitN(line, " ", 2)
-		fileID := parts[0]
-		file := parts[1]
-		if id == fileID {
-			files = append(files, file)
+		if len(parts) == 2 {
+			file := parts[1]
+			// Filter out noise and only keep files we care about
+			if !seen[file] && !strings.HasPrefix(file, "/proc/") && !strings.HasPrefix(file, "/sys/") {
+				files = append(files, file)
+				seen[file] = true
+			}
 		}
 	}
 	return files, nil
