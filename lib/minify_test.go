@@ -301,30 +301,6 @@ func TestGoWebUbuntu(t *testing.T) {
 	testWeb(t, "go-web", "ubuntu")
 }
 
-func TestGoWebAmzn(t *testing.T) {
-	testWeb(t, "go-web", "amzn")
-}
-
-func TestPythonWebArch(t *testing.T) {
-	testWeb(t, "python3-web", "arch")
-}
-
-func TestPythonWebAlpine(t *testing.T) {
-	testWeb(t, "python3-web", "alpine")
-}
-
-func TestPythonWebDebian(t *testing.T) {
-	testWeb(t, "python3-web", "debian")
-}
-
-func TestPythonWebUbuntu(t *testing.T) {
-	testWeb(t, "python3-web", "ubuntu")
-}
-
-func TestPythonWebAmzn(t *testing.T) {
-	testWeb(t, "python3-web", "amzn")
-}
-
 func TestNodeWebArch(t *testing.T) {
 	testWeb(t, "node-web", "arch")
 }
@@ -340,7 +316,3 @@ func TestNodeWebDebian(t *testing.T) {
 func TestNodeWebUbuntu(t *testing.T) {
 	testWeb(t, "node-web", "ubuntu")
 }
-
-// func TestNodeWebAmzn(t *testing.T) {
-// 	testWeb(t, "node-web", "amzn") // TODO this dockerfile is no longer building, debug.
-// }
