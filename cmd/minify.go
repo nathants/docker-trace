@@ -77,10 +77,10 @@ func runMinify(args minifyArgs) error {
 		return err
 	}
 	lib.Logger.Println("indexed export tar")
-	includeDirs, includeAll := expandIncludes(idx, includeExact)
+	parentDirs, fullDirs, includeAll := expandIncludes(idx, includeExact)
 	outPath := lib.DataDir() + "/out.tar." + uid
 	err = filterExportToTar(ctx, cli, contID, outPath,
-		includeDirs, includeAll)
+		parentDirs, fullDirs, includeAll)
 	if err != nil {
 		return err
 	}
@@ -229,15 +229,44 @@ func indexExport(ctx context.Context, cli *client.Client,
 }
 
 // expands includes with parents, extras, and link target closures
-func expandIncludes(idx *exportIndex, exact pathSet) (pathSet, pathSet) {
-	// includeDirs are all parent dirs and included directory paths
-	includeDirs := pathSet{}
+func expandIncludes(idx *exportIndex, exact pathSet) (pathSet, pathSet, pathSet) {
+	// parentDirs are parent dirs needed for structure only
+	parentDirs := pathSet{}
+	// fullDirs are explicitly included directories with all contents
+	fullDirs := pathSet{}
 	includeAll := pathSet{}
 	for p := range exact {
 		includeAll[p] = true
+		// Check if any parent in the path is a symlink
+		// If so, we need to include the resolved path too
+		parts := strings.Split(strings.TrimLeft(p, "/"), "/")
+		currentPath := ""
+		for i, part := range parts {
+			if i == 0 {
+				currentPath = "/" + part
+			} else {
+				currentPath = currentPath + "/" + part
+			}
+			target, isSymlink := idx.symlinks[currentPath]
+			if isSymlink && i < len(parts)-1 {
+				// This is a symlink in the middle of our path
+				// Resolve the rest of the path through the symlink
+				remainingPath := "/" + strings.Join(parts[i+1:], "/")
+				if !strings.HasPrefix(target, "/") {
+					// Relative symlink
+					target = path.Join(path.Dir(currentPath), target)
+				}
+				resolvedPath := path.Join(target, remainingPath)
+				resolvedPath = path.Clean(resolvedPath)
+				// Include the resolved path and follow its symlinks
+				includeAll[resolvedPath] = true
+				addLinkClosure(resolvedPath, includeAll, idx.symlinks, idx.hardlinks)
+				break
+			}
+		}
 		parents := parentsOf(p)
 		for _, d := range parents {
-			includeDirs[d] = true
+			parentDirs[d] = true
 		}
 	}
 	for p := range idx.rootLinks {
@@ -249,30 +278,84 @@ func expandIncludes(idx *exportIndex, exact pathSet) (pathSet, pathSet) {
 	for p := range idx.shellBins {
 		includeAll[p] = true
 	}
+	// Include symlinks that point to loader libraries
+	for symlink, target := range idx.symlinks {
+		// Check if target resolves to a loader lib
+		resolvedTarget := target
+		if !strings.HasPrefix(resolvedTarget, "/") {
+			resolvedTarget = path.Join(path.Dir(symlink), resolvedTarget)
+		}
+		resolvedTarget = path.Clean(resolvedTarget)
+		if idx.loaderLibs[resolvedTarget] {
+			includeAll[symlink] = true
+		}
+		// Also check if the symlink name matches the loader pattern
+		base := path.Base(symlink)
+		if strings.Contains(symlink, "/lib") && strings.Contains(base, "ld-linux") {
+			includeAll[symlink] = true
+		}
+	}
 	for p := range exact {
 		addLinkClosure(p, includeAll, idx.symlinks, idx.hardlinks)
 	}
-	// also include any symlink or hardlink name whose target is included
-	for s, tgt := range idx.symlinks {
-		if includeAll[tgt] {
-			includeAll[s] = true
-		}
-	}
-	for s, tgt := range idx.hardlinks {
-		if includeAll[tgt] {
-			includeAll[s] = true
+	// Follow symlinks for all included paths to ensure targets are included
+	// Need to iterate until no new paths are added
+	changed := true
+	for changed {
+		changed = false
+		for p := range includeAll {
+			if target, isSymlink := idx.symlinks[p]; isSymlink {
+				if !includeAll[target] {
+					includeAll[target] = true
+					changed = true
+					addLinkClosure(target, includeAll, idx.symlinks, idx.hardlinks)
+				}
+			}
+			if target, isHardlink := idx.hardlinks[p]; isHardlink {
+				if !includeAll[target] {
+					includeAll[target] = true
+					changed = true
+				}
+			}
 		}
 	}
 	// ensure parents of all included paths are created
+	// but if a parent is a symlink, include it fully
 	for p := range includeAll {
-		for _, d := range parentsOf(p) {
-			includeDirs[d] = true
+		parents := parentsOf(p)
+		for _, d := range parents {
+			if target, isSymlink := idx.symlinks[d]; isSymlink {
+				// Parent is a symlink, must include it fully
+				includeAll[d] = true
+				// Resolve target path
+				if !strings.HasPrefix(target, "/") {
+					// Relative symlink, resolve from parent of symlink
+					target = path.Join(path.Dir(d), target)
+				}
+				// Ensure symlink target's parent directories exist
+				for _, pd := range parentsOf(target) {
+					parentDirs[pd] = true
+				}
+				// Map the rest of the path after the symlink to the target
+				// e.g., /lib/x86_64-linux-gnu when /lib -> usr/lib
+				// means we need /usr/lib/x86_64-linux-gnu
+				remainingPath := strings.TrimPrefix(p, d)
+				if remainingPath != "" && remainingPath != p {
+					targetPath := path.Join(target, remainingPath)
+					for _, pd := range parentsOf(targetPath) {
+						parentDirs[pd] = true
+					}
+				}
+				addLinkClosure(d, includeAll, idx.symlinks, idx.hardlinks)
+			} else {
+				parentDirs[d] = true
+			}
 		}
 	}
-	// if an included path is a directory, include its children on pass2
+	// if an included path is a directory, mark it as fully included
 	for p := range exact {
 		if idx.dirs[p] {
-			includeDirs[p] = true
+			fullDirs[p] = true
 			for s, tgt := range idx.symlinks {
 				if strings.HasPrefix(s, p+"/") {
 					includeAll[s] = true
@@ -288,14 +371,14 @@ func expandIncludes(idx *exportIndex, exact pathSet) (pathSet, pathSet) {
 			}
 		}
 	}
-	return includeDirs, includeAll
+	return parentDirs, fullDirs, includeAll
 }
 
 // follows link chains to include both link and ultimate target
 func addLinkClosure(p string, out pathSet, syms, hard map[string]string) {
 	seen := pathSet{}
 	cur := p
-	for i := 0; i < 64; i++ {
+	for range 16 {
 		if seen[cur] {
 			return
 		}
@@ -332,7 +415,7 @@ func parentsOf(p string) []string {
 
 // writes a filtered export tar honoring includes with proper link order
 func filterExportToTar(ctx context.Context, cli *client.Client,
-	contID, outPath string, dirs, include pathSet) error {
+	contID, outPath string, parentDirs, fullDirs, include pathSet) error {
 	r, err := cli.ContainerExport(ctx, contID)
 	if err != nil {
 		return err
@@ -365,11 +448,18 @@ func filterExportToTar(ctx context.Context, cli *client.Client,
 		p = strings.TrimRight(p, "/")
 		ok := include[p]
 		if !ok {
-			for d := range dirs {
+			// Check if it's under a fully included directory
+			for d := range fullDirs {
 				if strings.HasPrefix(p, d+"/") || p == d {
 					ok = true
 					break
 				}
+			}
+		}
+		if !ok {
+			// Check if it's a parent directory (structure only)
+			if parentDirs[p] && hdr.Typeflag == tar.TypeDir {
+				ok = true
 			}
 		}
 		if !ok {
@@ -443,7 +533,7 @@ func writeDockerfile(ctx context.Context, dfPath, uid, in string) error {
 		_ = f.Close()
 		return err
 	}
-	_, err = f.WriteString(fmt.Sprintf("ADD out.tar.%s /\n", uid))
+	_, err = fmt.Fprintf(f, "ADD out.tar.%s /\n", uid)
 	if err != nil {
 		_ = f.Close()
 		return err

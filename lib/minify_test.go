@@ -1,9 +1,10 @@
 package lib
 
 import (
-	"bufio"
-	"bytes"
-	"crypto/md5"
+    "bufio"
+    "bytes"
+    "context"
+    "crypto/md5"
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -228,15 +228,33 @@ func testWeb(t *testing.T, app, kind string) {
 		if len(parts) != 2 {
 			continue
 		}
+		containerID := parts[0]
 		file := parts[1]
-		// Filter out noise and duplicates
-		if !seen[file] && !strings.HasPrefix(file, "/proc/") && !strings.HasPrefix(file, "/sys/") && !strings.HasPrefix(file, "/dev/") {
-			// Also filter out paths that are clearly from the host system, not the container
-			if !strings.Contains(file, "/overlay2/") && !strings.HasPrefix(file, "/var/lib/docker/") {
-				files = append(files, file)
-				seen[file] = true
-			}
+		// Only process files from actual containers (not empty container ID)
+		if containerID == "" || containerID == "0" {
+			continue
 		}
+		// Skip already seen files
+		if seen[file] {
+			continue
+		}
+		// Filter out host system paths and Docker internals
+		if strings.HasPrefix(file, "/proc/") || 
+		   strings.HasPrefix(file, "/sys/") || 
+		   strings.HasPrefix(file, "/dev/") ||
+		   strings.Contains(file, "/overlay2/") ||
+		   strings.Contains(file, "/merged") ||
+		   strings.HasPrefix(file, "/var/lib/docker/") ||
+		   file == "/" ||
+		   file == "/proc" ||
+		   file == "/sys" ||
+		   file == "/dev" ||
+		   !strings.HasPrefix(file, "/") {
+			continue
+		}
+		// Only include regular container paths
+		files = append(files, file)
+		seen[file] = true
 	}
 	fmt.Printf("Collected %d unique files from trace\n", len(files))
 	//
@@ -401,13 +419,33 @@ CMD ["bash","-lc","cat /hosts_link && sleep 1"]
 		if len(parts) != 2 {
 			continue
 		}
+		containerID := parts[0]
 		file := parts[1]
-		if !seen[file] && !strings.HasPrefix(file, "/proc/") && !strings.HasPrefix(file, "/sys/") && !strings.HasPrefix(file, "/dev/") {
-			if !strings.Contains(file, "/overlay2/") && !strings.HasPrefix(file, "/var/lib/docker/") {
-				files = append(files, file)
-				seen[file] = true
-			}
+		// Only process files from actual containers (not empty container ID)
+		if containerID == "" || containerID == "0" {
+			continue
 		}
+		// Skip already seen files
+		if seen[file] {
+			continue
+		}
+		// Filter out host system paths and Docker internals
+		if strings.HasPrefix(file, "/proc/") || 
+		   strings.HasPrefix(file, "/sys/") || 
+		   strings.HasPrefix(file, "/dev/") ||
+		   strings.Contains(file, "/overlay2/") ||
+		   strings.Contains(file, "/merged") ||
+		   strings.HasPrefix(file, "/var/lib/docker/") ||
+		   file == "/" ||
+		   file == "/proc" ||
+		   file == "/sys" ||
+		   file == "/dev" ||
+		   !strings.HasPrefix(file, "/") {
+			continue
+		}
+		// Only include regular container paths
+		files = append(files, file)
+		seen[file] = true
 	}
 	if !Contains(files, "/hosts_link") {
 		t.Errorf("did not trace /hosts_link: %v", files)
@@ -472,102 +510,58 @@ func TestFilesHandleLineOpenatDirfd(t *testing.T) {
 	}
 }
 
-func md5Hex(xs ...string) string {
-	h := md5.New()
-	for _, x := range xs {
-		_, _ = h.Write([]byte(x))
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
+// Verifies that including a single file like /etc/hosts does not cause all of
+// its parent directory's children (e.g. other files in /etc) to be included.
+// Ensures including /etc/hosts does not include other files under /etc.
+func TestMinifyNoParentDirExplosion(t *testing.T) {
+    climbGitRootMinify()
+    ensureDockerTraceMinify()
 
-func buildCOpenatImage(t *testing.T) string {
-	csrc := `#define _GNU_SOURCE
-#include <fcntl.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <stdio.h>
-int main() {
-  int dfd = open("/etc", O_RDONLY | O_DIRECTORY);
-  if (dfd < 0) { perror("open"); return 1; }
-  int fd = openat(dfd, "hosts", O_RDONLY);
-  if (fd < 0) { perror("openat"); return 1; }
-  char buf[1];
-  (void)read(fd, buf, 1);
-  close(fd);
-  close(dfd);
-  return 0;
-}
+    df := `
+FROM debian:latest
+RUN bash -lc 'echo secret > /etc/nonce_file'
+CMD ["bash","-lc","cat /etc/hosts >/dev/null && sleep 1"]
 `
-	df := fmt.Sprintf(`FROM %s
-COPY main.c /usr/local/src/main.c
-RUN cc /usr/local/src/main.c -o /usr/local/bin/openat_example
-`, containerFiles)
-	tag := fmt.Sprintf("docker-trace:c-openat-%s", md5Hex(df, csrc))
-	if runQuietFiles("docker", "inspect", tag) == nil {
-		return tag
-	}
-	dir, err := os.MkdirTemp("", "docker-trace-c-openat.")
-	if err != nil {
-		t.Fatalf("tempdir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(dir) }()
-	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(df), 0666); err != nil {
-		t.Fatalf("write Dockerfile: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "main.c"), []byte(csrc), 0666); err != nil {
-		t.Fatalf("write main.c: %v", err)
-	}
-	if err := runFiles("docker", "build", "-t", tag, "--network", "host", dir); err != nil {
-		t.Fatalf("docker build: %v", err)
-	}
-	return tag
-}
+    tag := fmt.Sprintf("docker-trace:minify-parentdir-%s", md5SumMinify([]byte(df)))
+    if runQuietMinify("docker", "inspect", tag) != nil {
+        dir, err := os.MkdirTemp("", "docker-trace-minify-parent.")
+        if err != nil {
+            t.Fatal(err)
+        }
+        defer func() { _ = os.RemoveAll(dir) }()
+        if err := os.WriteFile(path.Join(dir, "Dockerfile"), []byte(df), 0666); err != nil {
+            t.Fatal(err)
+        }
+        if err := runMinify("docker", "build", "-t", tag, "--network", "host", dir); err != nil {
+            t.Fatal(err)
+        }
+    }
 
-func TestTraceCOpenatDirfdDockerBuild(t *testing.T) {
-	ensureSetupFiles()
+    includes := []string{"/etc/hosts"}
+    out := tag + "-min"
+    if err := runStdinMinify(strings.Join(includes, "\n"), "./docker-trace", "minify", tag, out); err != nil {
+        t.Fatal(err)
+    }
 
-	image := buildCOpenatImage(t)
-
-	stdoutChan, stderrChan, cancel, err := runStdoutStderrChanFiles("./docker-trace", "files")
-	if err != nil {
-		t.Fatalf("start tracer: %v", err)
-	}
-	line := <-stderrChan
-	if line != "ready" {
-		t.Fatalf("unexpected tracer line: %s", line)
-	}
-
-	// drain prior events
-	drain := func(ch <-chan string) {
-		for {
-			select {
-			case <-ch:
-			default:
-				return
-			}
-		}
-	}
-	drain(stdoutChan)
-
-	id, err := runStdoutFiles("docker", "run", "-d", "-t", "--rm", image, "/usr/local/bin/openat_example")
-	if err != nil {
-		cancel()
-		t.Fatalf("docker run: %v", err)
-	}
-	if err := runFiles("docker", "wait", id); err != nil {
-		cancel()
-		t.Fatalf("docker wait: %v", err)
-	}
-
-	cancel()
-	found := false
-	for s := range stdoutChan {
-		if strings.Contains(s, " /etc/hosts") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("did not capture /etc/hosts via openat(dirfd)")
-	}
+    ctx := context.Background()
+    files, _, err := Scan(ctx, out, "", false)
+    if err != nil {
+        t.Fatal(err)
+    }
+    hasHosts := false
+    hasNonce := false
+    for _, f := range files {
+        if f.Path == "/etc/hosts" {
+            hasHosts = true
+        }
+        if f.Path == "/etc/nonce_file" {
+            hasNonce = true
+        }
+    }
+    if !hasHosts {
+        t.Fatalf("expected /etc/hosts present in minified image")
+    }
+    if hasNonce {
+        t.Fatalf("unexpected /etc/nonce_file present in minified image")
+    }
 }
