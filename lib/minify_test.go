@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -421,5 +422,152 @@ CMD ["bash","-lc","cat /hosts_link && sleep 1"]
 	if err != nil {
 		t.Error(err)
 		return
+	}
+}
+
+func TestFilesHandleLineOpenatDirfd(t *testing.T) {
+	dfd, err := os.Open("/etc")
+	if err != nil {
+		t.Fatalf("open /etc: %v", err)
+	}
+	defer func() { _ = dfd.Close() }()
+
+	pid := os.Getpid()
+	cwds := map[string]string{}
+	cgroups := map[string]string{"cg1": "container1"}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer func() {
+		_ = r.Close()
+		_ = w.Close()
+	}()
+
+	oldStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = oldStdout }()
+
+	line := fmt.Sprintf(
+		"openat\tcg1\t%d\t0\tproc\t0\thosts\t%d",
+		pid, dfd.Fd(),
+	)
+	FilesHandleLine(cwds, cgroups, line)
+
+	_ = w.Close()
+	scanner := bufio.NewScanner(r)
+	found := false
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) == "container1 /etc/hosts" {
+			found = true
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan stdout: %v", err)
+	}
+	if !found {
+		t.Fatalf("expected 'container1 /etc/hosts' not found")
+	}
+}
+
+func md5Hex(xs ...string) string {
+	h := md5.New()
+	for _, x := range xs {
+		_, _ = h.Write([]byte(x))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func buildCOpenatImage(t *testing.T) string {
+	csrc := `#define _GNU_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+int main() {
+  int dfd = open("/etc", O_RDONLY | O_DIRECTORY);
+  if (dfd < 0) { perror("open"); return 1; }
+  int fd = openat(dfd, "hosts", O_RDONLY);
+  if (fd < 0) { perror("openat"); return 1; }
+  char buf[1];
+  (void)read(fd, buf, 1);
+  close(fd);
+  close(dfd);
+  return 0;
+}
+`
+	df := fmt.Sprintf(`FROM %s
+COPY main.c /usr/local/src/main.c
+RUN cc /usr/local/src/main.c -o /usr/local/bin/openat_example
+`, containerFiles)
+	tag := fmt.Sprintf("docker-trace:c-openat-%s", md5Hex(df, csrc))
+	if runQuietFiles("docker", "inspect", tag) == nil {
+		return tag
+	}
+	dir, err := os.MkdirTemp("", "docker-trace-c-openat.")
+	if err != nil {
+		t.Fatalf("tempdir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(df), 0666); err != nil {
+		t.Fatalf("write Dockerfile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.c"), []byte(csrc), 0666); err != nil {
+		t.Fatalf("write main.c: %v", err)
+	}
+	if err := runFiles("docker", "build", "-t", tag, "--network", "host", dir); err != nil {
+		t.Fatalf("docker build: %v", err)
+	}
+	return tag
+}
+
+func TestTraceCOpenatDirfdDockerBuild(t *testing.T) {
+	ensureSetupFiles()
+
+	image := buildCOpenatImage(t)
+
+	stdoutChan, stderrChan, cancel, err := runStdoutStderrChanFiles("./docker-trace", "files")
+	if err != nil {
+		t.Fatalf("start tracer: %v", err)
+	}
+	line := <-stderrChan
+	if line != "ready" {
+		t.Fatalf("unexpected tracer line: %s", line)
+	}
+
+	// drain prior events
+	drain := func(ch <-chan string) {
+		for {
+			select {
+			case <-ch:
+			default:
+				return
+			}
+		}
+	}
+	drain(stdoutChan)
+
+	id, err := runStdoutFiles("docker", "run", "-d", "-t", "--rm", image, "/usr/local/bin/openat_example")
+	if err != nil {
+		cancel()
+		t.Fatalf("docker run: %v", err)
+	}
+	if err := runFiles("docker", "wait", id); err != nil {
+		cancel()
+		t.Fatalf("docker wait: %v", err)
+	}
+
+	cancel()
+	found := false
+	for s := range stdoutChan {
+		if strings.Contains(s, " /etc/hosts") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("did not capture /etc/hosts via openat(dirfd)")
 	}
 }

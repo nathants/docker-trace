@@ -1,3 +1,6 @@
+// core library for image scanning and tracing commands
+// provides tar parsing, docker manifest logic and bpftrace line handling
+// ensures file path reconstruction handles cwd, overlay fs and dirfd semantics
 package lib
 
 import (
@@ -613,12 +616,13 @@ type File struct {
 	Comm    string
 	Errno   string
 	File    string
+	Dirfd   string
 }
 
 func FilesParseLine(line string) File {
 	parts := strings.Split(line, "\t")
 	file := File{}
-	if len(parts) != 7 {
+	if len(parts) < 7 {
 		Logger.Printf("skipping bpftrace line: %s\n", line)
 		return file
 	}
@@ -629,6 +633,9 @@ func FilesParseLine(line string) File {
 	file.Comm = parts[4]
 	file.Errno = parts[5]
 	file.File = parts[6]
+	if len(parts) >= 8 {
+		file.Dirfd = parts[7]
+	}
 	// sometimes file paths include the fs driver paths
 	//
 	// /mnt/docker-data/overlay2/1b7b19463b59ac563677fda461918ae2faed45d86000fc68cf0eb8052687c121/merged/etc/hosts
@@ -689,6 +696,19 @@ func FilesHandleLine(cwds, cgroups map[string]string, line string) {
 				cwds[file.Pid] = path.Join(cwds[file.Pid], file.File)
 			}
 		}
+		// resolve relative paths using dirfd first for *at syscalls
+		if file.Dirfd != "" && len(file.File) > 0 && file.File[:1] != "/" {
+			dfd, err := strconv.ParseInt(file.Dirfd, 10, 64)
+			if err == nil {
+				if dfd != -100 { // AT_FDCWD
+					link := fmt.Sprintf("/proc/%s/fd/%d", file.Pid, dfd)
+					base, err := os.Readlink(link)
+					if err == nil && base != "" {
+						file.File = path.Join(base, file.File)
+					}
+				}
+			}
+		}
 		// join any relative paths to pid cwd
 		if file.File[:1] != "/" {
 			cwd, ok := cwds[file.Pid]
@@ -696,6 +716,20 @@ func FilesHandleLine(cwds, cgroups map[string]string, line string) {
 				panic(cwds)
 			}
 			file.File = path.Join(cwd, file.File)
+		}
+		// normalize overlay/zfs backing fs paths to container paths
+		if strings.Contains(file.File, "/overlay2/") {
+			file.File = last(strings.Split(file.File, "/overlay2/"))
+			parts := strings.Split(file.File, "/")
+			if len(parts) > 2 {
+				file.File = "/" + strings.Join(parts[2:], "/")
+			}
+		} else if strings.Contains(file.File, "/zfs/graph/") {
+			file.File = last(strings.Split(file.File, "/zfs/graph/"))
+			parts := strings.Split(file.File, "/")
+			if len(parts) > 1 {
+				file.File = "/" + strings.Join(parts[1:], "/")
+			}
 		}
 		//
 		containerID := cgroups[file.Cgroup]
