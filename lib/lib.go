@@ -588,7 +588,7 @@ func Dockerfile(ctx context.Context, name string, tarball string) ([]string, err
 		if regex.FindString(line) != "" && !strings.HasPrefix(line, "ADD ") && !strings.HasPrefix(line, "COPY ") && !strings.HasPrefix(line, "RUN ") && !strings.HasPrefix(line, "LABEL ") {
 			if strings.HasPrefix(line, "EXPOSE ") && strings.Contains(line, " map[") {
 				regex := regexp.MustCompile(`[0-9]+`)
-				ports := regex.FindAllString("EXPOSE map[8080/4545]", -1)
+				ports := regex.FindAllString(line, -1)
 				line = "EXPOSE " + strings.Join(ports, " ")
 			}
 			if strings.HasPrefix(line, "ENV ") {
