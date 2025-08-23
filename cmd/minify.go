@@ -10,396 +10,542 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/alexflint/go-arg"
 	"github.com/docker/docker/api/types/build"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/gofrs/uuid"
 	"github.com/nathants/docker-trace/lib"
 )
 
+// register the minify command with its args for cli dispatch
 func init() {
 	lib.Commands["minify"] = minify
 	lib.Args["minify"] = minifyArgs{}
 }
 
+// holds required input and output container names
 type minifyArgs struct {
 	ContainerIn  string `arg:"positional,required"`
 	ContainerOut string `arg:"positional,required"`
 }
 
+// returns human readable description for -h usage
 func (minifyArgs) Description() string {
 	return "\nminify a container keeping files passed on stdin\n"
 }
 
+// entrypoint for minify that parses args and runs pipeline
 func minify() {
 	var args minifyArgs
 	arg.MustParse(&args)
-	//
-	lib.Logger.Println("start minification", args.ContainerIn, "=>", args.ContainerOut)
+	err := runMinify(args)
+	if err != nil {
+		lib.Logger.Fatal("error: ", err)
+	}
+}
+
+// orchestrates export, filter, and build restoring metadata
+func runMinify(args minifyArgs) error {
+	lib.Logger.Println("start minification", args.ContainerIn, "=>",
+		args.ContainerOut)
 	ctx := context.Background()
 	uid := uuid.Must(uuid.NewV4()).String()
-	//
 	cli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return err
 	}
-	//
 	lib.Logger.Println("created docker client")
-	//
-	r, err := cli.ImageSave(ctx, []string{args.ContainerIn})
+	includeExact, err := readIncludeStdin()
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return err
 	}
-	w, err := os.OpenFile(lib.DataDir()+"/in.tar."+uid, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
+	lib.Logger.Println("included paths:", len(includeExact))
+	contID, err := createExportContainer(ctx, cli, args.ContainerIn)
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return err
 	}
-	_, err = io.Copy(w, r)
+	defer func() {
+		_ = cli.ContainerRemove(ctx, contID,
+			container.RemoveOptions{Force: true})
+	}()
+	idx, err := indexExport(ctx, cli, contID)
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return err
 	}
-	err = w.Close()
+	lib.Logger.Println("indexed export tar")
+	includeDirs, includeAll := expandIncludes(idx, includeExact)
+	outPath := lib.DataDir() + "/out.tar." + uid
+	err = filterExportToTar(ctx, cli, contID, outPath,
+		includeDirs, includeAll)
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return err
 	}
-	lib.Logger.Println("saved input container to disk")
-	//
-	files, layers, err := lib.Scan(ctx, args.ContainerIn, lib.DataDir()+"/in.tar."+uid, false)
+	lib.Logger.Println("finished writing out.tar")
+	dfPath := lib.DataDir() + "/Dockerfile." + uid
+	err = writeDockerfile(ctx, dfPath, uid, args.ContainerIn)
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return err
 	}
-	lib.Logger.Println("scanned container")
-	//
-	includePaths := map[string]interface{}{}
+	lib.Logger.Println("created new dockerfile")
+	err = buildFromContext(ctx, cli, dfPath, outPath, uid,
+		args.ContainerOut)
+	if err != nil {
+		return err
+	}
+	lib.Logger.Println("built minified image")
+	if err := os.Remove(outPath); err != nil {
+		return err
+	}
+	if err := os.Remove(dfPath); err != nil {
+		return err
+	}
+	lib.Logger.Println("minification complete")
+	return nil
+}
+
+// pathSet is a string set used for path membership checks
+type pathSet map[string]bool
+
+// reads stdin include list, normalizes, and deduplicates paths
+func readIncludeStdin() (pathSet, error) {
+	// reads stdin fully, splits, cleans, forces leading slash, dedups
 	bytes, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return nil, err
 	}
-	for _, path := range strings.Split(string(bytes), "\n") {
-		path = strings.Trim(path, " ")
-		path = filepath.Clean(path)
-		path = strings.ReplaceAll(path, "/./", "/")
-		if path != "" {
-			includePaths[path] = nil
+	result := pathSet{}
+	lines := strings.Split(string(bytes), "\n")
+	for _, p := range lines {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
 		}
+		p = filepath.Clean(p)
+		p = strings.ReplaceAll(p, "/./", "/")
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+		p = strings.TrimRight(p, "/")
+		result[p] = true
 	}
-	lib.Logger.Println("included paths:", len(includePaths))
-	//
-	includeFiles := make(map[string]*lib.ScanFile)
-	var last *lib.ScanFile
-	links := make(map[string]string)
-	for _, f := range files {
-		if f.LinkTarget != "" {
-			links[f.Path] = f.LinkTarget
-		}
-	}
-	//
-	// recursively resolve all links
-	for p := range includePaths {
-		last := ""
-		for {
-			if last == p {
-				break // break when no further change
-			}
-			last = p
-			parts := strings.Split(strings.TrimLeft(p, "/"), "/")
-			for i := 0; i <= len(parts); i++ {
-				subPath := "/" + path.Join(parts[:i]...)
-				link, ok := links[subPath]
-				if ok {
-					if link[:1] != "/" {
-						link = path.Join(path.Dir(subPath), link)
-					}
-					includePaths[subPath] = nil
-					includePaths[link] = nil
-					for j := range parts[:i] {
-						parts[j] = ""
-					}
-					parts[0] = link
-				}
-			}
-			p2 := path.Join(parts...)
-			includePaths[p2] = nil
-			p = p2
-		}
-	}
-	lib.Logger.Println("recursively resolved links")
-	//
-	for _, f := range files {
-		f.Path = strings.ReplaceAll(f.Path, "/./", "/")
-		_, ok := includePaths[strings.TrimRight(f.Path, "/")]
-		if !ok {
-			// sometimes files must always be included, here are some hard coded special cases
-			atRoot := len(strings.Split(f.Path, "/")) == 2 && f.LinkTarget != ""
-			ldSo := strings.Contains(f.Path, "/lib") && strings.HasPrefix(path.Base(f.Path), "ld-") && strings.Contains(f.Path, ".so")
-			name := path.Base(f.Path)
-			isShell := (name == "bash" || name == "sh" || name == "env") && strings.Contains(f.Path, "/bin/")
-			if !(atRoot || ldSo || isShell) {
-				continue
-			}
-			includePaths[f.Path] = nil
-		}
-		if last != nil && f.Path != last.Path {
-			includeFiles[last.Path] = last
-		}
-		last = f
-	}
-	includeFiles[last.Path] = last
-	lib.Logger.Println("update include paths for ld-*.so and symlinks at root")
-	//
-	r, err = os.Open(lib.DataDir() + "/in.tar." + uid)
+	return result, nil
+}
+
+// creates a stopped container from image for export tar
+func createExportContainer(ctx context.Context, cli *client.Client,
+	image string) (string, error) {
+	cfg := &container.Config{Image: image, Cmd: []string{"/bin/sh", "-c",
+		"#"}}
+	resp, err := cli.ContainerCreate(ctx, cfg, nil, nil, nil, "")
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return "", err
+	}
+	return resp.ID, nil
+}
+
+// exportIndex caches dirs and link relations discovered from export
+type exportIndex struct {
+	dirs       pathSet
+	symlinks   map[string]string
+	hardlinks  map[string]string
+	rootLinks  pathSet
+	loaderLibs pathSet
+	shellBins  pathSet
+}
+
+// scans export tar once to record dirs, symlinks, hardlinks and extras
+func indexExport(ctx context.Context, cli *client.Client,
+	contID string) (*exportIndex, error) {
+	r, err := cli.ContainerExport(ctx, contID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = r.Close() }()
+	idx := &exportIndex{
+		dirs:       pathSet{},
+		symlinks:   map[string]string{},
+		hardlinks:  map[string]string{},
+		rootLinks:  pathSet{},
+		loaderLibs: pathSet{},
+		shellBins:  pathSet{},
 	}
 	tr := tar.NewReader(r)
-	//
-	w, err = os.OpenFile(lib.DataDir()+"/out.tar."+uid, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
-	if err != nil {
-		lib.Logger.Fatal("error: ", err)
-	}
-	tw := tar.NewWriter(w)
 	for {
-		header, err := tr.Next()
+		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+			return nil, err
 		}
-		if header == nil {
+		if hdr == nil {
 			continue
 		}
-		switch header.Typeflag {
+		p := "/" + strings.ReplaceAll(hdr.Name, "/./", "/")
+		p = strings.TrimRight(p, "/")
+		base := path.Base(p)
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			idx.dirs[p] = true
+		case tar.TypeSymlink:
+			tgt := hdr.Linkname
+			if !strings.HasPrefix(tgt, "/") {
+				tgt = path.Join(path.Dir(p), tgt)
+			}
+			tgt = filepath.Clean(tgt)
+			if !strings.HasPrefix(tgt, "/") {
+				tgt = "/" + tgt
+			}
+			tgt = strings.TrimRight(tgt, "/")
+			idx.symlinks[p] = tgt
+			if len(strings.Split(p, "/")) == 2 {
+				idx.rootLinks[p] = true
+			}
+		case tar.TypeLink:
+			tgt := hdr.Linkname
+			if !strings.HasPrefix(tgt, "/") {
+				tgt = "/" + tgt
+			}
+			tgt = filepath.Clean(tgt)
+			tgt = strings.TrimRight(tgt, "/")
+			idx.hardlinks[p] = tgt
 		case tar.TypeReg:
-			// OCI format: layers are blobs/sha256/* files
-			if _, ok := layers[header.Name]; ok {
-				minifyLayer(header.Name, tr, tw, layers, includeFiles)
-				lib.Logger.Println("minified layer", header.Name)
+			if strings.Contains(p, "/lib") && strings.HasPrefix(base, "ld-") &&
+				strings.Contains(base, ".so") {
+				idx.loaderLibs[p] = true
+			}
+			if (base == "bash" || base == "sh" || base == "env") &&
+				strings.Contains(p, "/bin/") {
+				idx.shellBins[p] = true
+			}
+		default:
+		}
+	}
+	return idx, nil
+}
+
+// expands includes with parents, extras, and link target closures
+func expandIncludes(idx *exportIndex, exact pathSet) (pathSet, pathSet) {
+	// includeDirs are all parent dirs and included directory paths
+	includeDirs := pathSet{}
+	includeAll := pathSet{}
+	for p := range exact {
+		includeAll[p] = true
+		parents := parentsOf(p)
+		for _, d := range parents {
+			includeDirs[d] = true
+		}
+	}
+	for p := range idx.rootLinks {
+		includeAll[p] = true
+	}
+	for p := range idx.loaderLibs {
+		includeAll[p] = true
+	}
+	for p := range idx.shellBins {
+		includeAll[p] = true
+	}
+	for p := range exact {
+		addLinkClosure(p, includeAll, idx.symlinks, idx.hardlinks)
+	}
+	// also include any symlink or hardlink name whose target is included
+	for s, tgt := range idx.symlinks {
+		if includeAll[tgt] {
+			includeAll[s] = true
+		}
+	}
+	for s, tgt := range idx.hardlinks {
+		if includeAll[tgt] {
+			includeAll[s] = true
+		}
+	}
+	// ensure parents of all included paths are created
+	for p := range includeAll {
+		for _, d := range parentsOf(p) {
+			includeDirs[d] = true
+		}
+	}
+	// if an included path is a directory, include its children on pass2
+	for p := range exact {
+		if idx.dirs[p] {
+			includeDirs[p] = true
+			for s, tgt := range idx.symlinks {
+				if strings.HasPrefix(s, p+"/") {
+					includeAll[s] = true
+					addLinkClosure(tgt, includeAll, idx.symlinks,
+						idx.hardlinks)
+				}
+			}
+			for s, tgt := range idx.hardlinks {
+				if strings.HasPrefix(s, p+"/") {
+					includeAll[s] = true
+					includeAll[tgt] = true
+				}
 			}
 		}
 	}
-	err = tw.Close()
-	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+	return includeDirs, includeAll
+}
+
+// follows link chains to include both link and ultimate target
+func addLinkClosure(p string, out pathSet, syms, hard map[string]string) {
+	seen := pathSet{}
+	cur := p
+	for i := 0; i < 64; i++ {
+		if seen[cur] {
+			return
+		}
+		seen[cur] = true
+		tgt, ok := syms[cur]
+		if ok {
+			out[cur] = true
+			out[tgt] = true
+			cur = tgt
+			continue
+		}
+		tgt, ok = hard[cur]
+		if ok {
+			out[cur] = true
+			out[tgt] = true
+			cur = tgt
+			continue
+		}
+		return
 	}
-	err = w.Close()
-	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+}
+
+// returns parent directories for a path excluding root
+func parentsOf(p string) []string {
+	var dirs []string
+	parts := strings.Split(strings.TrimLeft(p, "/"), "/")
+	for i := 1; i < len(parts); i++ {
+		d := "/" + path.Join(parts[:i]...)
+		d = strings.TrimRight(d, "/")
+		dirs = append(dirs, d)
 	}
-	lib.Logger.Println("finished writing out.tar")
-	//
-	f, err := os.OpenFile(lib.DataDir()+"/Dockerfile."+uid, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
+	return dirs
+}
+
+// writes a filtered export tar honoring includes with proper link order
+func filterExportToTar(ctx context.Context, cli *client.Client,
+	contID, outPath string, dirs, include pathSet) error {
+	r, err := cli.ContainerExport(ctx, contID)
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return err
 	}
-	lines, err := lib.Dockerfile(ctx, args.ContainerIn, lib.DataDir()+"/in.tar."+uid)
+	defer func() { _ = r.Close() }()
+	w, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		return err
 	}
-	lib.Logger.Println("read original dockerfile")
-	//
+	tw := tar.NewWriter(w)
+	defer func() {
+		_ = tw.Close()
+		_ = w.Close()
+	}()
+	emitted := pathSet{}
+	var pending []tar.Header
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if hdr == nil {
+			continue
+		}
+		p := "/" + strings.ReplaceAll(hdr.Name, "/./", "/")
+		p = strings.TrimRight(p, "/")
+		ok := include[p]
+		if !ok {
+			for d := range dirs {
+				if strings.HasPrefix(p, d+"/") || p == d {
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok {
+			continue
+		}
+		// ensure we write directories and symlinks immediately
+		switch hdr.Typeflag {
+		case tar.TypeDir, tar.TypeSymlink:
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
+			emitted[p] = true
+			continue
+		case tar.TypeLink:
+			// delay hardlinks until target likely emitted
+			pending = append(pending, *hdr)
+			continue
+		case tar.TypeReg:
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
+			if _, err := io.Copy(tw, tr); err != nil {
+				return err
+			}
+			emitted[p] = true
+			continue
+		default:
+			// include unknowns by header only
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
+			emitted[p] = true
+			continue
+		}
+	}
+	// flush pending hardlinks after files are emitted
+	// sort for stable output
+	sort.SliceStable(pending, func(i, j int) bool {
+		return pending[i].Name < pending[j].Name
+	})
+	for i := range pending {
+		hdr := pending[i]
+		// only write if target was emitted or link references itself
+		tgt := hdr.Linkname
+		if !strings.HasPrefix(tgt, "/") {
+			tgt = "/" + tgt
+		}
+		tgt = strings.TrimRight(filepath.Clean(tgt), "/")
+		if emitted[tgt] || tgt == "/"+strings.TrimRight(hdr.Name, "/") {
+			if err := tw.WriteHeader(&hdr); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// writes Dockerfile to add filtered tar and restore metadata
+func writeDockerfile(ctx context.Context, dfPath, uid, in string) error {
+	f, err := os.OpenFile(dfPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
+	if err != nil {
+		return err
+	}
+	lines, err := lib.Dockerfile(ctx, in, "")
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
 	_, err = f.WriteString("FROM scratch\n")
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		_ = f.Close()
+		return err
 	}
 	_, err = f.WriteString(fmt.Sprintf("ADD out.tar.%s /\n", uid))
 	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+		_ = f.Close()
+		return err
 	}
 	for _, line := range lines {
 		_, err := f.WriteString(line + "\n")
 		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+			_ = f.Close()
+			return err
 		}
 	}
-	err = f.Close()
-	if err != nil {
-		lib.Logger.Fatal("error: ", err)
-	}
-	lib.Logger.Println("created new dockerfile")
-	//
-	prContext, pwContext := io.Pipe()
+	return f.Close()
+}
+
+// streams build context and builds, tagging output image
+func buildFromContext(ctx context.Context, cli *client.Client,
+	dfPath, outPath, uid, tag string) error {
+	pr, pw := io.Pipe()
 	go func() {
 		// defer func() {}()
-		tw = tar.NewWriter(pwContext)
-		//
-		fi, err := os.Stat(lib.DataDir() + "/out.tar." + uid)
+		tw := tar.NewWriter(pw)
+		fi, err := os.Stat(outPath)
 		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+			_ = pw.CloseWithError(err)
+			return
 		}
-		header, err := tar.FileInfoHeader(fi, "")
-		header.Name = "out.tar." + uid
+		hdr, err := tar.FileInfoHeader(fi, "")
 		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+			_ = pw.CloseWithError(err)
+			return
 		}
-		err = tw.WriteHeader(header)
+		hdr.Name = "out.tar." + uid
+		if err := tw.WriteHeader(hdr); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		rf, err := os.Open(outPath)
 		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+			_ = pw.CloseWithError(err)
+			return
 		}
-		err = r.Close()
+		if _, err := io.Copy(tw, rf); err != nil {
+			_ = rf.Close()
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = rf.Close()
+		fi, err = os.Stat(dfPath)
 		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+			_ = pw.CloseWithError(err)
+			return
 		}
-		r, err = os.Open(lib.DataDir() + "/out.tar." + uid)
+		hdr, err = tar.FileInfoHeader(fi, "")
 		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+			_ = pw.CloseWithError(err)
+			return
 		}
-		_, err = io.Copy(tw, r)
+		hdr.Name = "Dockerfile." + uid
+		if err := tw.WriteHeader(hdr); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		df, err := os.Open(dfPath)
 		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+			_ = pw.CloseWithError(err)
+			return
 		}
-		//
-		fi, err = os.Stat(lib.DataDir() + "/Dockerfile." + uid)
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+		if _, err := io.Copy(tw, df); err != nil {
+			_ = df.Close()
+			_ = pw.CloseWithError(err)
+			return
 		}
-		header, err = tar.FileInfoHeader(fi, "")
-		header.Name = "Dockerfile." + uid
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
+		_ = df.Close()
+		if err := tw.Close(); err != nil {
+			_ = pw.CloseWithError(err)
+			return
 		}
-		err = tw.WriteHeader(header)
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
-		}
-		err = r.Close()
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
-		}
-		r, err = os.Open(lib.DataDir() + "/Dockerfile." + uid)
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
-		}
-		_, err = io.Copy(tw, r)
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
-		}
-		//
-		err = tw.Close()
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
-		}
-		err = pwContext.Close()
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
-		}
-		//
-		err = r.Close()
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
-		}
-		lib.Logger.Println("finished writing context")
+		_ = pw.Close()
 	}()
-	//
-	out, err := cli.ImageBuild(ctx, prContext, build.ImageBuildOptions{
+	opts := build.ImageBuildOptions{
 		NoCache:    true,
-		Tags:       []string{args.ContainerOut},
+		Tags:       []string{tag},
 		Dockerfile: "Dockerfile." + uid,
 		Remove:     true,
-	})
-	defer func() { _ = out.Body.Close() }()
-	if err != nil {
-		lib.Logger.Fatal("error: ", err)
 	}
-	//
+	out, err := cli.ImageBuild(ctx, pr, opts)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Body.Close() }()
 	scanner := bufio.NewScanner(out.Body)
 	val := make(map[string]string)
 	for scanner.Scan() {
-		err := json.Unmarshal(scanner.Bytes(), &val)
-		if err == nil {
+		if err := json.Unmarshal(scanner.Bytes(), &val); err == nil {
 			lib.Logger.Println(strings.Trim(val["stream"], "\n"))
 		}
 	}
-	err = scanner.Err()
-	if err != nil {
-		lib.Logger.Fatal("error: ", err)
+	if err := scanner.Err(); err != nil {
+		return err
 	}
-	if val["stream"] != "Successfully tagged "+args.ContainerOut+"\n" {
-		lib.Logger.Fatal("error: failed to build " + args.ContainerOut)
+	if val["stream"] != "Successfully tagged "+tag+"\n" {
+		return fmt.Errorf("error: failed to build %s", tag)
 	}
-	lib.Logger.Println("built minified image")
-	//
-	err = os.Remove(lib.DataDir() + "/in.tar." + uid)
-	if err != nil {
-		lib.Logger.Fatal("error: ", err)
-	}
-	err = os.Remove(lib.DataDir() + "/out.tar." + uid)
-	if err != nil {
-		lib.Logger.Fatal("error: ", err)
-	}
-	err = os.Remove(lib.DataDir() + "/Dockerfile." + uid)
-	if err != nil {
-		lib.Logger.Fatal("error: ", err)
-	}
-	lib.Logger.Println("minification complete")
-}
-
-func minifyLayer(layer string, r io.Reader, tw *tar.Writer, layers map[string]int, includeFiles map[string]*lib.ScanFile) {
-	layerIndex, ok := layers[layer]
-	if !ok {
-		panic(layer)
-	}
-	tr := tar.NewReader(r)
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			lib.Logger.Fatal("error: ", err)
-		}
-		if header == nil {
-			continue
-		}
-		pth := strings.ReplaceAll("/"+header.Name, "/./", "/")
-		includeFile, ok := includeFiles[pth]
-		if !ok {
-			continue
-		}
-		if includeFile.LayerIndex != layerIndex {
-			continue
-		}
-		switch header.Typeflag {
-		case tar.TypeReg:
-			err := tw.WriteHeader(header)
-			if err != nil {
-				lib.Logger.Fatal("error: ", err)
-			}
-			_, err = io.Copy(tw, tr)
-			if err != nil {
-				lib.Logger.Fatal("error: ", err)
-			}
-		case tar.TypeSymlink:
-			err := tw.WriteHeader(header)
-			if err != nil {
-				lib.Logger.Fatal("error: ", err)
-			}
-			_, err = io.Copy(tw, tr)
-			if err != nil {
-				lib.Logger.Fatal("error: ", err)
-			}
-		case tar.TypeDir:
-			err := tw.WriteHeader(header)
-			if err != nil {
-				lib.Logger.Fatal("error: ", err)
-			}
-			_, err = io.Copy(tw, tr)
-			if err != nil {
-				lib.Logger.Fatal("error: ", err)
-			}
-		case tar.TypeLink:
-			err := tw.WriteHeader(header)
-			if err != nil {
-				lib.Logger.Fatal("error: ", err)
-			}
-			_, err = io.Copy(tw, tr)
-			if err != nil {
-				lib.Logger.Fatal("error: ", err)
-			}
-		default:
-			panic(fmt.Sprintf("unknown tar type: %v", header.Typeflag))
-		}
-	}
+	return nil
 }

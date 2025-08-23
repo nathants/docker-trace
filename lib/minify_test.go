@@ -338,3 +338,88 @@ func TestNodeWebDebian(t *testing.T) {
 func TestNodeWebUbuntu(t *testing.T) {
 	testWeb(t, "node-web", "ubuntu")
 }
+
+func TestSymlinkClosureDebian(t *testing.T) {
+	climbGitRootMinify()
+	ensureDockerTraceMinify()
+	dockerfile := `
+FROM debian:latest
+RUN ln -s /etc/hosts /hosts_link
+CMD ["bash","-lc","cat /hosts_link && sleep 1"]
+`
+	hash := md5SumMinify([]byte(dockerfile))
+	container := fmt.Sprintf("docker-trace:minify-symlink-debian-%s", hash)
+	if runQuietMinify("docker", "inspect", container) != nil {
+		dir, err := os.MkdirTemp("", "docker-trace-test.")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = os.RemoveAll(dir) }()
+		err = os.WriteFile(path.Join(dir, "Dockerfile"), []byte(dockerfile), 0666)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		err = runMinify("docker", "build", "-t", container, "--network", "host", dir)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}
+	stdoutChan, stderrChan, cancel, err := runStdoutStderrChanMinify("./docker-trace", "files")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	line := <-stderrChan
+	if line != "ready" {
+		t.Error(line)
+		return
+	}
+	drain := func(ch <-chan string) {
+		for {
+			select {
+			case <-ch:
+			default:
+				return
+			}
+		}
+	}
+	drain(stdoutChan)
+	_, err = runStdoutMinify("docker", "run", "--rm", "--network", "host", container)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	cancel()
+	var files []string
+	seen := make(map[string]bool)
+	for line := range stdoutChan {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		file := parts[1]
+		if !seen[file] && !strings.HasPrefix(file, "/proc/") && !strings.HasPrefix(file, "/sys/") && !strings.HasPrefix(file, "/dev/") {
+			if !strings.Contains(file, "/overlay2/") && !strings.HasPrefix(file, "/var/lib/docker/") {
+				files = append(files, file)
+				seen[file] = true
+			}
+		}
+	}
+	if !Contains(files, "/hosts_link") {
+		t.Errorf("did not trace /hosts_link: %v", files)
+		return
+	}
+	err = runStdinMinify(strings.Join(files, "\n"), "./docker-trace", "minify", container, container+"-min")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	err = runMinify("docker", "run", "--rm", container+"-min", "bash", "-lc", "cat /hosts_link >/dev/null")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+}

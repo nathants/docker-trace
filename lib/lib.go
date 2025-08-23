@@ -222,7 +222,7 @@ func FindManifest(manifests []Manifest, name string) (Manifest, error) {
 			return Manifest{}, err
 		}
 	}
-	err := fmt.Errorf("%s", Pformat(manifests) + "\ntag not found in manifest")
+	err := fmt.Errorf("%s", Pformat(manifests)+"\ntag not found in manifest")
 	Logger.Println("error:", err)
 	return Manifest{}, err
 }
@@ -234,20 +234,10 @@ func Scan(ctx context.Context, name string, tarball string, checkData bool) ([]*
 		return nil, nil, err
 	}
 
-	// Save image to a buffer first so we can read it twice
-	var imageData bytes.Buffer
+	cleanup := func() {}
+	var tarPath string
 	if tarball != "" {
-		file, err := os.Open(tarball)
-		if err != nil {
-			Logger.Println("error:", err)
-			return nil, nil, err
-		}
-		defer func() { _ = file.Close() }()
-		_, err = io.Copy(&imageData, file)
-		if err != nil {
-			Logger.Println("error:", err)
-			return nil, nil, err
-		}
+		tarPath = tarball
 	} else {
 		r, err := cli.ImageSave(ctx, []string{name})
 		if err != nil {
@@ -255,74 +245,116 @@ func Scan(ctx context.Context, name string, tarball string, checkData bool) ([]*
 			return nil, nil, err
 		}
 		defer func() { _ = r.Close() }()
-		_, err = io.Copy(&imageData, r)
+		f, err := os.CreateTemp(DataDir(), "scan-*.tar")
 		if err != nil {
 			Logger.Println("error:", err)
 			return nil, nil, err
 		}
+		tarPath = f.Name()
+		cleanup = func() {
+			_ = f.Close()
+			_ = os.Remove(tarPath)
+		}
+		_, err = io.Copy(f, r)
+		if err != nil {
+			Logger.Println("error:", err)
+			cleanup()
+			return nil, nil, err
+		}
+		err = f.Close()
+		if err != nil {
+			Logger.Println("error:", err)
+			cleanup()
+			return nil, nil, err
+		}
 	}
+	defer cleanup()
 
-	// First pass: extract manifest to identify layer blobs
 	var manifests []Manifest
-	layerBlobs := make(map[string]bool)
-	tr := tar.NewReader(bytes.NewReader(imageData.Bytes()))
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
+	layerBlobs := map[string]bool{}
+	{
+		file, err := os.Open(tarPath)
 		if err != nil {
 			Logger.Println("error:", err)
 			return nil, nil, err
 		}
-		if header == nil {
-			continue
-		}
-		if header.Typeflag == tar.TypeReg && header.Name == "manifest.json" {
-			var data bytes.Buffer
-			_, err := io.Copy(&data, tr)
+		tr := tar.NewReader(file)
+		for {
+			header, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
 			if err != nil {
+				_ = file.Close()
 				Logger.Println("error:", err)
 				return nil, nil, err
 			}
-			err = json.Unmarshal(data.Bytes(), &manifests)
-			if err != nil {
-				Logger.Println("error:", err)
-				return nil, nil, err
+			if header == nil {
+				continue
 			}
-			// Mark layer blobs for OCI format
-			for _, m := range manifests {
-				for _, layer := range m.Layers {
-					layerBlobs[layer] = true
+			if header.Typeflag == tar.TypeReg && header.Name == "manifest.json" {
+				var data bytes.Buffer
+				_, err := io.Copy(&data, tr)
+				if err != nil {
+					_ = file.Close()
+					Logger.Println("error:", err)
+					return nil, nil, err
 				}
+				err = json.Unmarshal(data.Bytes(), &manifests)
+				if err != nil {
+					_ = file.Close()
+					Logger.Println("error:", err)
+					return nil, nil, err
+				}
+				for _, m := range manifests {
+					for _, layer := range m.Layers {
+						layerBlobs[layer] = true
+					}
+				}
+				break
 			}
-			break // Found manifest, no need to continue first pass
+		}
+		if err := file.Close(); err != nil {
+			Logger.Println("error:", err)
+			return nil, nil, err
 		}
 	}
 
-	// Second pass: process layers
 	var files []*ScanFile
-	tr = tar.NewReader(bytes.NewReader(imageData.Bytes()))
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
+	{
+		file, err := os.Open(tarPath)
 		if err != nil {
 			Logger.Println("error:", err)
 			return nil, nil, err
 		}
-		if header == nil {
-			continue
-		}
-		if header.Typeflag == tar.TypeReg && layerBlobs[header.Name] {
-			// Handle OCI format with blobs/sha256/* files
-			layerFiles, err := ScanLayer(header.Name, tr, checkData)
+		tr := tar.NewReader(file)
+		for {
+			header, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
 			if err != nil {
+				_ = file.Close()
 				Logger.Println("error:", err)
 				return nil, nil, err
 			}
-			files = append(files, layerFiles...)
+			if header == nil {
+				continue
+			}
+			if header.Typeflag == tar.TypeReg && layerBlobs[header.Name] {
+				layerFiles, err := ScanLayer(header.Name, tr, checkData)
+				if err != nil {
+					_ = file.Close()
+					Logger.Println("error:", err)
+					return nil, nil, err
+				}
+				files = append(files, layerFiles...)
+			}
+		}
+		err = file.Close()
+		if err != nil {
+			Logger.Println("error:", err)
+			return nil, nil, err
 		}
 	}
 
@@ -351,7 +383,6 @@ func Scan(ctx context.Context, name string, tarball string, checkData bool) ([]*
 	sort.Slice(files, func(i, j int) bool { return files[i].LayerIndex < files[j].LayerIndex })
 	sort.SliceStable(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 
-	// keep only last update to the file, not all updates across all layers
 	var result []*ScanFile
 	var last *ScanFile
 	for _, f := range files {
