@@ -16,6 +16,7 @@ import (
 	"github.com/alexflint/go-arg"
 	"github.com/docker/docker/api/types/build"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/gofrs/uuid"
 	"github.com/nathants/docker-trace/lib"
@@ -85,22 +86,13 @@ func runMinify(args minifyArgs) error {
 		return err
 	}
 	lib.Logger.Println("finished writing out.tar")
-	dfPath := lib.DataDir() + "/Dockerfile." + uid
-	err = writeDockerfile(ctx, dfPath, uid, args.ContainerIn)
+	err = importTarAsImage(ctx, cli, outPath, args.ContainerOut,
+		args.ContainerIn)
 	if err != nil {
 		return err
 	}
-	lib.Logger.Println("created new dockerfile")
-	err = buildFromContext(ctx, cli, dfPath, outPath, uid,
-		args.ContainerOut)
-	if err != nil {
-		return err
-	}
-	lib.Logger.Println("built minified image")
+	lib.Logger.Println("imported minified image")
 	if err := os.Remove(outPath); err != nil {
-		return err
-	}
-	if err := os.Remove(dfPath); err != nil {
 		return err
 	}
 	lib.Logger.Println("minification complete")
@@ -546,6 +538,74 @@ func writeDockerfile(ctx context.Context, dfPath, uid, in string) error {
 		}
 	}
 	return f.Close()
+}
+
+// imports tar directly as image, avoiding memory-heavy build context
+func importTarAsImage(ctx context.Context, cli *client.Client,
+	tarPath, tag, origImage string) error {
+	// Open the tar file for streaming
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	// Get metadata from original image to apply to imported image
+	lines, err := lib.Dockerfile(ctx, origImage, "")
+	if err != nil {
+		return err
+	}
+	// Build changes array for import options
+	// Only include commands that ImageImport accepts
+	var changes []string
+	validCommands := map[string]bool{
+		"CMD":         true,
+		"ENTRYPOINT":  true,
+		"ENV":         true,
+		"EXPOSE":      true,
+		"LABEL":       true,
+		"ONBUILD":     true,
+		"USER":        true,
+		"VOLUME":      true,
+		"WORKDIR":     true,
+		"STOPSIGNAL":  true,
+		"HEALTHCHECK": true,
+		"SHELL":       true,
+	}
+	for _, line := range lines {
+		// Check if line starts with a valid command
+		for cmd := range validCommands {
+			if strings.HasPrefix(line, cmd+" ") || line == cmd {
+				changes = append(changes, line)
+				break
+			}
+		}
+	}
+	// Import the tar directly as a new image
+	resp, err := cli.ImageImport(ctx, image.ImportSource{
+		Source:     f,
+		SourceName: "-",
+	}, tag, image.ImportOptions{
+		Changes: changes,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Close() }()
+	// Read the response to ensure the import completes
+	scanner := bufio.NewScanner(resp)
+	for scanner.Scan() {
+		var result map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &result); err == nil {
+			if status, ok := result["status"].(string); ok {
+				lib.Logger.Println(strings.TrimSpace(status))
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	lib.Logger.Printf("imported image: %s", tag)
+	return nil
 }
 
 // streams build context and builds, tagging output image
